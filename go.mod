@@ -111,6 +111,7 @@ require (
 	github.com/vishvananda/netns v0.0.4 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	gitlab.com/yawning/bsaes.git v0.0.0-20190805113838-0a714cd429ec // indirect
+	golang.org/x/mobile v0.0.0-20260312152759-81488f6aeb60 // indirect
 	golang.org/x/mod v0.34.0 // indirect
 	golang.org/x/text v0.35.0 // indirect
 	golang.org/x/time v0.10.0 // indirect
