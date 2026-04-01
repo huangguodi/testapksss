@@ -93,9 +93,36 @@ func Start(home, configFileName string) {
 	if err := config.Init(C.Path.HomeDir()); err != nil {
 		panic(err)
 	}
-	if err := hub.Parse(nil); err != nil {
+
+	// iOS 定制优化：强制覆盖部分配置以满足 iOS 扩展的严苛限制
+	err := hub.Parse(nil, func(cfg *config.Config) {
+		// 1. 关闭 DNS 劫持，减少不必要的内存和处理
+		if cfg.General.Tun.Enable {
+			cfg.General.Tun.DNSHijack = nil
+			cfg.General.Tun.AutoDetectInterface = false
+			cfg.General.Tun.AutoRoute = false
+			// 2. 强制系统栈，关闭 gvisor 以降低内存占用（25MB 限制），并单线程处理
+			cfg.General.Tun.Stack = C.TunSystem
+		}
+		
+		// 3. 关闭非核心组件（例如外部控制器和 UI）
+		cfg.Controller.ExternalController = ""
+		cfg.Controller.ExternalUI = ""
+
+		// 4. 降低连接池大小 (通过降低并发限制或相关设置)
+		cfg.General.TCPConcurrent = false
+
+		// 5. 日志太多会导致扩展被 kill，强制将日志级别设置为 Error 或 Silent
+		cfg.General.LogLevel = log.ERROR
+		log.SetLevel(log.ERROR)
+		
+		// 6. 关闭流量统计，以避免内存泄露和并发性能损耗
+		statistic.DefaultManager.Disable = true
+	})
+	if err != nil {
 		panic(err)
 	}
+
 	isActive = true
 }
 

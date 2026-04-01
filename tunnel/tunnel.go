@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -30,8 +29,8 @@ import (
 )
 
 const (
-	queueCapacity  = 64  // chan capacity tcpQueue and udpQueue
-	senderCapacity = 128 // chan capacity of PacketSender
+	queueCapacity  = 16  // iOS optimization: reduce queue capacity to save memory
+	senderCapacity = 32  // iOS optimization: lower sender capacity
 )
 
 var (
@@ -79,10 +78,8 @@ func (t tunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
 }
 
 func initUDP() {
-	numUDPWorkers := 4
-	if num := runtime.GOMAXPROCS(0); num > numUDPWorkers {
-		numUDPWorkers = num
-	}
+	numUDPWorkers := 1   // iOS optimization: strict single-thread/low concurrency for UDP
+	// Do not scale with GOMAXPROCS to prevent memory surge on iOS
 
 	udpQueues = make([]chan C.PacketAdapter, numUDPWorkers)
 	for i := 0; i < numUDPWorkers; i++ {

@@ -518,6 +518,13 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
 		return
 	}
 
+	// iOS 定制：如果使用了 FileDescriptor，不允许重启 TUN（否则 fd 会被关闭，且无法重新绑定）
+	if LastTunConf.FileDescriptor != 0 && tunLister != nil {
+		log.Warnln("[TUN] FileDescriptor is set, ignore recreating TUN to prevent fd leak or re-bind failure on iOS.")
+		tunLister.OnReload()
+		return
+	}
+
 	closeTunListener()
 
 	if !tunConf.Enable {

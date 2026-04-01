@@ -35,13 +35,20 @@ type Manager struct {
 	downloadTotal atomic.Int64
 	pid           int32
 	memory        uint64
+	Disable       bool
 }
 
 func (m *Manager) Join(c Tracker) {
+	if m.Disable {
+		return
+	}
 	m.connections.Store(c.ID(), c)
 }
 
 func (m *Manager) Leave(c Tracker) {
+	if m.Disable {
+		return
+	}
 	m.connections.Delete(c.ID())
 }
 
@@ -59,11 +66,17 @@ func (m *Manager) Range(f func(c Tracker) bool) {
 }
 
 func (m *Manager) PushUploaded(size int64) {
+	if m.Disable {
+		return
+	}
 	m.uploadTemp.Add(size)
 	m.uploadTotal.Add(size)
 }
 
 func (m *Manager) PushDownloaded(size int64) {
+	if m.Disable {
+		return
+	}
 	m.downloadTemp.Add(size)
 	m.downloadTotal.Add(size)
 }
