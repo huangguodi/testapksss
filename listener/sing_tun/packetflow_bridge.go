@@ -3,7 +3,6 @@ package sing_tun
 import (
 	"errors"
 	"sync"
-	"github.com/metacubex/mihomo/log"
 )
 
 type PacketFlowPacket struct {
