@@ -187,9 +187,10 @@ func strategyConsistentHashing(url string) strategyFn {
 func strategyStickySessions(url string) strategyFn {
 	ttl := time.Minute * 10
 	maxRetry := 5
+	// iOS: 降低 LRU Cache 大小以节省内存
 	lruCache := lru.New[uint64, int](
 		lru.WithAge[uint64, int](int64(ttl.Seconds())),
-		lru.WithSize[uint64, int](1000))
+		lru.WithSize[uint64, int](200))
 	return func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
 		key := utils.MapHash(getKeyWithSrcAndDst(metadata))
 		length := len(proxies)

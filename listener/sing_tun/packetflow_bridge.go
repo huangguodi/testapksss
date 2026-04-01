@@ -12,8 +12,15 @@ type PacketFlowPacket struct {
 }
 
 func NewPacketFlowPacket(data []byte, af int64) *PacketFlowPacket {
-	cloned := append([]byte(nil), data...)
-	return &PacketFlowPacket{data: cloned, af: af}
+	bPtr := packetDataPool.Get().(*[]byte)
+	b := *bPtr
+	if cap(b) < len(data) {
+		b = make([]byte, len(data))
+	} else {
+		b = b[:len(data)]
+	}
+	copy(b, data)
+	return &PacketFlowPacket{data: b, af: af}
 }
 
 func (p *PacketFlowPacket) Data() []byte {
@@ -54,7 +61,8 @@ func SetPacketFlowBridge(bridge PacketFlowBridge) {
 	packetFlowBridgeMu.Lock()
 	packetFlowBridge = bridge
 	if bridge != nil && packetInboundQueue == nil {
-		packetInboundQueue = make(chan *PacketFlowPacket, 8192)
+		// 降低队列长度到 1024，避免因队列堆积导致内存溢出 (1024 * 1500B ≈ 1.5MB)
+		packetInboundQueue = make(chan *PacketFlowPacket, 1024)
 	}
 	if bridge == nil {
 		packetInboundQueue = nil
@@ -163,11 +171,10 @@ func (t *packetFlowTun) Read(p []byte) (int, error) {
 			
 			// Return to pool after reading
 			if cap(packet.data) >= 1500 {
-				packet.data = packet.data[:cap(packet.data)]
-				packetDataPool.Put(&packet.data)
+				reusableSlice := packet.data[:cap(packet.data)]
+				packetDataPool.Put(&reusableSlice)
 			}
 			
-			log.Debugln("[iOS-Debug] [sing_tun] ReadPacket from packetFlow af=%d size=%d", packet.af, payloadLen)
 			return payloadLen, nil
 		}
 	}
@@ -187,10 +194,17 @@ func (t *packetFlowTun) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 	packet := NewPacketFlowPacket(p, af)
-	log.Debugln("[iOS-Debug] [sing_tun] WritePacket to packetFlow af=%d size=%d", packet.af, len(packet.data))
 	if !t.bridge.WritePacket(packet) {
 		t.bridge.OnPacketFlowError("write packet failed")
 	}
+	
+	// WritePacket (通过 gomobile 到 Swift) 是同步拷贝过程
+	// 返回后可以安全地将内存放回内存池，避免持续产生 GC 压力
+	if cap(packet.data) >= 1500 {
+		reusableSlice := packet.data[:cap(packet.data)]
+		packetDataPool.Put(&reusableSlice)
+	}
+	
 	return len(p), nil
 }
 

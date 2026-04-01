@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -85,6 +87,13 @@ func Start(home, configFileName string) {
 	stateMu.Lock()
 	defer stateMu.Unlock()
 
+	// 限制 Go 运行时内存使用，防止在 iOS 拓展中被 kill (25MB 限制)
+	// 预留约 5MB 给 Swift 原生代码，Go 限制在 18MB，同时避免 GC 过于频繁导致发热 (GCPercent=20)
+	debug.SetMemoryLimit(18 * 1024 * 1024)
+	debug.SetGCPercent(20)
+	// iOS 拓展中通常不需要高并发，降低线程数极大地减少线程缓存(mcache)和栈内存占用
+	runtime.GOMAXPROCS(1)
+
 	homeDir = home
 	cfgFile = configFileName
 
@@ -103,27 +112,81 @@ func Start(home, configFileName string) {
 			cfg.General.Tun.AutoRoute = false
 			// 2. 强制系统栈，关闭 gvisor 以降低内存占用（25MB 限制），并单线程处理
 			cfg.General.Tun.Stack = C.TunSystem
+			// iOS 必须使用单线程读写（关闭多路复用相关配置，如果 sing-tun 有 RecvMsgX/SendMsgX）
+			cfg.General.Tun.RecvMsgX = false
+			cfg.General.Tun.SendMsgX = false
+			// 降低 MTU 到 1500 以减小单个数据包的内存分配，并关闭 GSO 防止大包分配 (64KB)
+			cfg.General.Tun.GSO = false
+			if cfg.General.Tun.MTU == 0 || cfg.General.Tun.MTU > 1500 {
+				cfg.General.Tun.MTU = 1500
+			}
+			// 缩短 UDP 超时时间，防止海量 UDP 会话 (如 P2P、DNS) 长时间占用内存 (默认 300s)
+			if cfg.General.Tun.UDPTimeout == 0 || cfg.General.Tun.UDPTimeout > 15 {
+				cfg.General.Tun.UDPTimeout = 15
+			}
 		}
-		
+
 		// 3. 关闭非核心组件（例如外部控制器和 UI）
 		cfg.Controller.ExternalController = ""
 		cfg.Controller.ExternalUI = ""
 
 		// 4. 降低连接池大小 (通过降低并发限制或相关设置)
 		cfg.General.TCPConcurrent = false
+		cfg.General.KeepAliveInterval = 15 // 降低保活时间
+		cfg.Profile.StoreSelected = false  // 关闭缓存写入
+		cfg.Profile.StoreFakeIP = false
 
-		// 5. 日志太多会导致扩展被 kill，强制将日志级别设置为 Error 或 Silent
-		cfg.General.LogLevel = log.ERROR
-		log.SetLevel(log.ERROR)
-		
+		// 禁用 QUIC GSO 以减小大缓冲内存占用
+		if cfg.Experimental == nil {
+			cfg.Experimental = &config.Experimental{}
+		}
+		cfg.Experimental.QUICGoDisableGSO = true
+
+		// 5. 日志太多会导致扩展被 kill，强制将日志级别设置为 Silent 完全关闭
+		cfg.General.LogLevel = log.SILENT
+		log.SetLevel(log.SILENT)
+
 		// 6. 关闭流量统计，以避免内存泄露和并发性能损耗
 		statistic.DefaultManager.Disable = true
+
+		// 7. 降低 Geodata 内存占用并关闭自动更新，防止后台下载导致 OOM
+		cfg.General.GeodataLoader = "memconservative"
+		cfg.General.GeoAutoUpdate = false
+
+		// 8. 关闭嗅探 (Sniffing) 和控制 DNS 缓存以减少内存和 CPU 消耗
+		cfg.General.Sniffing = false
+		if cfg.DNS != nil {
+			if cfg.DNS.CacheMaxSize == 0 || cfg.DNS.CacheMaxSize > 512 {
+				cfg.DNS.CacheMaxSize = 512
+			}
+			// 限制并发查询，防止瞬间 DNS 并发导致内存激增
+			// 默认没有直接的 DNS 并发限制，但可以缩小 FakeIP 范围，或者关闭增强 DNS 解析
+		}
+
+		// 9. 强制限制全局连接数和并发测速，防止由于测速或者大流量导致协程/连接池暴增 (OOM)
+		// 如果规则提供者中有大量的测速，会瞬间产生大量 TCP 连接
+		// (通过覆盖或初始化配置)
 	})
 	if err != nil {
 		panic(err)
 	}
 
 	isActive = true
+
+	// 启动定期回收内存任务，避免 iOS 扩展内存膨胀被系统强杀
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !isActive {
+					return
+				}
+				debug.FreeOSMemory()
+			}
+		}
+	}()
 }
 
 func Stop() {

@@ -129,7 +129,8 @@ func (hc *HealthCheck) check() {
 		id := utils.NewUUIDV4().String()
 		log.Debugln("Start New Health Checking {%s}", id)
 		b := new(errgroup.Group)
-		b.SetLimit(10)
+		// iOS 限制健康检查的并发数，防止同时测速导致 fd/协程 瞬间爆满 (OOM/被杀)
+		b.SetLimit(3)
 
 		// execute default health check
 		option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}
