@@ -1,0 +1,53 @@
+name: Build iOS Library
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25.0'
+
+    - name: Install dependencies
+      run: go mod download
+
+    - name: Install gomobile
+      run: |
+        go install golang.org/x/mobile/cmd/gomobile@latest
+        go install golang.org/x/mobile/cmd/gobind@latest
+        gomobile init
+
+    - name: Build iOS xcframework
+      run: |
+        gomobile bind -target=ios -iosversion=14.0 -o mihomo.xcframework ./mobile
+        
+    - name: Extract .a and .h files
+      run: |
+        mkdir -p output/include
+        # gomobile outputs a static library without .a extension inside the framework
+        cp mihomo.xcframework/ios-arm64/mihomo.framework/mihomo output/libmihomo.a
+        cp -r mihomo.xcframework/ios-arm64/mihomo.framework/Headers/ output/include/
+
+    - name: Upload .a and .h Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: mihomo-ios-static-lib
+        path: output/
+        
+    - name: Upload xcframework Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: mihomo-ios-xcframework
+        path: mihomo.xcframework/
