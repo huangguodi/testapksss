@@ -142,6 +142,12 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	}
 	ctx := context.TODO()
 	rpTunnel := tunnel.(P.Tunnel)
+	openedPlatformTunFD := 0
+	defer func() {
+		if err != nil && openedPlatformTunFD != 0 {
+			_ = os.NewFile(uintptr(openedPlatformTunFD), "").Close()
+		}
+	}()
 	if options.GSOMaxSize == 0 {
 		options.GSOMaxSize = 65536
 	}
@@ -149,13 +155,14 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		options.AutoRedirect = false
 	}
 	tunName := options.Device
-	if options.FileDescriptor == 0 && (tunName == "" || !checkTunName(tunName)) {
+	usePlatformOpenTun := runtime.GOOS == "ios" && options.FileDescriptor == 0 && HasPlatformOpenTunHandler()
+	if runtime.GOOS != "ios" && options.FileDescriptor == 0 && (tunName == "" || !checkTunName(tunName)) {
 		tunName = CalculateInterfaceName(InterfaceName)
 		options.Device = tunName
 	}
 	forwarderBindInterface := false
 	if options.FileDescriptor > 0 {
-		if tunnelName, err := getTunnelName(int32(options.FileDescriptor)); err != nil {
+		if tunnelName, err := getTunnelName(int32(options.FileDescriptor)); err == nil {
 			tunName = tunnelName // sing-tun must have the truth tun interface name even it from a fd
 			forwarderBindInterface = true
 		}
@@ -274,6 +281,26 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		addrPort := netip.AddrPortFrom(a.Addr().Next(), 53)
 		dnsServerIp = append(dnsServerIp, a.Addr().Next().String())
 		dnsAdds = append(dnsAdds, addrPort)
+	}
+
+	if usePlatformOpenTun {
+		platformTunOptions := newPlatformTunOptions(tunName, tunMTU, options, routeAddress, routeExcludeAddress, dnsServerIp)
+		fd, openErr := openPlatformTun(platformTunOptions)
+		if openErr != nil {
+			return nil, E.Cause(openErr, "open tun from platform callback")
+		}
+		if fd <= 0 {
+			return nil, E.New("open tun from platform callback returned invalid fd")
+		}
+		openedPlatformTunFD = fd
+		options.FileDescriptor = fd
+		options.AutoRoute = false
+		options.AutoRedirect = false
+		if tunnelName, err := getTunnelName(int32(fd)); err == nil {
+			tunName = tunnelName
+			options.Device = tunnelName
+			forwarderBindInterface = true
+		}
 	}
 
 	h, err := sing.NewListenerHandler(sing.ListenerConfig{
@@ -453,6 +480,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		err = E.Cause(err, "configure tun interface")
 		return
 	}
+	openedPlatformTunFD = 0
 
 	l.dnsServerIp = dnsServerIp
 	// after tun.New sing-tun has set DNS to TUN interface

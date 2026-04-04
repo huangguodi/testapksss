@@ -34,6 +34,8 @@ type closeFdTun struct {
 
 func (t *closeFdTun) Close() error {
 	err := t.Tun.Close()
-	syscall.Close(t.fd)
+	if t.fd != 0 {
+		_ = syscall.Close(t.fd)
+	}
 	return err
 }

@@ -3,6 +3,7 @@ package listener
 import (
 	"fmt"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -519,8 +520,8 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
 	}
 
 	// iOS 定制：如果使用了 FileDescriptor，不允许重启 TUN（否则 fd 会被关闭，且无法重新绑定）
-	if LastTunConf.FileDescriptor != 0 && tunLister != nil {
-		log.Warnln("[TUN] FileDescriptor is set, ignore recreating TUN to prevent fd leak or re-bind failure on iOS.")
+	if tunLister != nil && runtime.GOOS == "ios" && (sing_tun.HasPlatformOpenTunHandler() || LastTunConf.FileDescriptor != 0 || tunLister.Config().FileDescriptor != 0) {
+		log.Warnln("[TUN] TUN is running in iOS fd/platform-callback mode, ignore recreating TUN to prevent fd leak or utun re-bind failure.")
 		tunLister.OnReload()
 		return
 	}

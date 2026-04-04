@@ -3,6 +3,7 @@ package mobile
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -23,6 +24,7 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub"
 	"github.com/metacubex/mihomo/hub/executor"
+	"github.com/metacubex/mihomo/listener/sing_tun"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
@@ -36,11 +38,39 @@ var (
 	socketProtectorMu  sync.RWMutex
 	currentProtector   SocketProtector
 	socketHookAttached bool
+	tunOpenerMu        sync.RWMutex
+	currentTunOpener   TunOpener
 )
 
 type SocketProtector interface {
 	ProtectSocket(fd int64, network string, address string) bool
 	MarkSocket(fd int64, network string, address string) bool
+}
+
+type TunOpener interface {
+	OpenTun(options *TunOptions) int64
+}
+
+type TunOptions struct {
+	payload tunOptionsPayload
+	json    string
+}
+
+type tunOptionsPayload struct {
+	Name                  string   `json:"name"`
+	MTU                   uint32   `json:"mtu"`
+	Stack                 string   `json:"stack"`
+	AutoRoute             bool     `json:"autoRoute"`
+	StrictRoute           bool     `json:"strictRoute"`
+	DNSHijack             []string `json:"dnsHijack,omitempty"`
+	DNSServers            []string `json:"dnsServers,omitempty"`
+	Inet4Address          []string `json:"inet4Address,omitempty"`
+	Inet6Address          []string `json:"inet6Address,omitempty"`
+	RouteAddress          []string `json:"routeAddress,omitempty"`
+	RouteExcludeAddress   []string `json:"routeExcludeAddress,omitempty"`
+	IncludeInterface      []string `json:"includeInterface,omitempty"`
+	ExcludeInterface      []string `json:"excludeInterface,omitempty"`
+	DisableICMPForwarding bool     `json:"disableICMPForwarding"`
 }
 
 func SetSocketProtector(protector SocketProtector) {
@@ -83,6 +113,81 @@ func ClearSocketProtector() {
 	SetSocketProtector(nil)
 }
 
+func SetTunOpener(opener TunOpener) {
+	tunOpenerMu.Lock()
+	currentTunOpener = opener
+	tunOpenerMu.Unlock()
+
+	if opener == nil {
+		sing_tun.ClearPlatformOpenTunHandler()
+		return
+	}
+
+	sing_tun.SetPlatformOpenTunHandler(func(options *sing_tun.PlatformTunOptions) (int, error) {
+		tunOpenerMu.RLock()
+		current := currentTunOpener
+		tunOpenerMu.RUnlock()
+		if current == nil {
+			return 0, errors.New("tun opener is not set")
+		}
+		fd := current.OpenTun(newTunOptions(options))
+		if fd <= 0 {
+			return 0, fmt.Errorf("tun opener returned invalid fd: %d", fd)
+		}
+		return int(fd), nil
+	})
+}
+
+func ClearTunOpener() {
+	SetTunOpener(nil)
+}
+
+func applyIOSConfigOverrides(cfg *config.Config) {
+	if cfg.General.Tun.Enable {
+		cfg.General.Tun.DNSHijack = nil
+		cfg.General.Tun.AutoDetectInterface = false
+		cfg.General.Tun.Stack = C.TunSystem
+		cfg.General.Tun.RecvMsgX = false
+		cfg.General.Tun.SendMsgX = false
+		cfg.General.Tun.AutoRedirect = false
+		cfg.General.Tun.GSO = false
+		if cfg.General.Tun.MTU == 0 || cfg.General.Tun.MTU > 1500 {
+			cfg.General.Tun.MTU = 1500
+		}
+		if cfg.General.Tun.UDPTimeout == 0 || cfg.General.Tun.UDPTimeout > 15 {
+			cfg.General.Tun.UDPTimeout = 15
+		}
+	}
+
+	cfg.Controller.ExternalController = ""
+	cfg.Controller.ExternalUI = ""
+
+	cfg.General.TCPConcurrent = false
+	cfg.General.KeepAliveInterval = 15
+	cfg.Profile.StoreSelected = false
+	cfg.Profile.StoreFakeIP = false
+
+	if cfg.Experimental == nil {
+		cfg.Experimental = &config.Experimental{}
+	}
+	cfg.Experimental.QUICGoDisableGSO = true
+
+	cfg.General.LogLevel = log.SILENT
+	log.SetLevel(log.SILENT)
+
+	statistic.DefaultManager.Disable = true
+
+	cfg.General.GeodataLoader = "memconservative"
+	cfg.General.GeoAutoUpdate = false
+
+	cfg.General.Sniffing = false
+	if cfg.DNS != nil {
+		if cfg.DNS.CacheMaxSize == 0 || cfg.DNS.CacheMaxSize > 512 {
+			cfg.DNS.CacheMaxSize = 512
+		}
+	}
+}
+
 func Start(home, configFileName string) {
 	stateMu.Lock()
 	defer stateMu.Unlock()
@@ -100,75 +205,15 @@ func Start(home, configFileName string) {
 	C.SetHomeDir(homeDir)
 	C.SetConfig(filepath.Join(homeDir, cfgFile))
 	if err := config.Init(C.Path.HomeDir()); err != nil {
-		panic(err)
+		log.Errorln("start config init failed: %s", err.Error())
+		return
 	}
 
 	// iOS 定制优化：强制覆盖部分配置以满足 iOS 扩展的严苛限制
-	err := hub.Parse(nil, func(cfg *config.Config) {
-		// 1. 关闭 DNS 劫持，减少不必要的内存和处理
-		if cfg.General.Tun.Enable {
-			cfg.General.Tun.DNSHijack = nil
-			cfg.General.Tun.AutoDetectInterface = false
-			cfg.General.Tun.AutoRoute = false
-			// 2. 强制系统栈，关闭 gvisor 以降低内存占用（25MB 限制），并单线程处理
-			cfg.General.Tun.Stack = C.TunSystem
-			// iOS 必须使用单线程读写（关闭多路复用相关配置，如果 sing-tun 有 RecvMsgX/SendMsgX）
-			cfg.General.Tun.RecvMsgX = false
-			cfg.General.Tun.SendMsgX = false
-			// 降低 MTU 到 1500 以减小单个数据包的内存分配，并关闭 GSO 防止大包分配 (64KB)
-			cfg.General.Tun.GSO = false
-			if cfg.General.Tun.MTU == 0 || cfg.General.Tun.MTU > 1500 {
-				cfg.General.Tun.MTU = 1500
-			}
-			// 缩短 UDP 超时时间，防止海量 UDP 会话 (如 P2P、DNS) 长时间占用内存 (默认 300s)
-			if cfg.General.Tun.UDPTimeout == 0 || cfg.General.Tun.UDPTimeout > 15 {
-				cfg.General.Tun.UDPTimeout = 15
-			}
-		}
-
-		// 3. 关闭非核心组件（例如外部控制器和 UI）
-		cfg.Controller.ExternalController = ""
-		cfg.Controller.ExternalUI = ""
-
-		// 4. 降低连接池大小 (通过降低并发限制或相关设置)
-		cfg.General.TCPConcurrent = false
-		cfg.General.KeepAliveInterval = 15 // 降低保活时间
-		cfg.Profile.StoreSelected = false  // 关闭缓存写入
-		cfg.Profile.StoreFakeIP = false
-
-		// 禁用 QUIC GSO 以减小大缓冲内存占用
-		if cfg.Experimental == nil {
-			cfg.Experimental = &config.Experimental{}
-		}
-		cfg.Experimental.QUICGoDisableGSO = true
-
-		// 5. 日志太多会导致扩展被 kill，强制将日志级别设置为 Silent 完全关闭
-		cfg.General.LogLevel = log.SILENT
-		log.SetLevel(log.SILENT)
-
-		// 6. 关闭流量统计，以避免内存泄露和并发性能损耗
-		statistic.DefaultManager.Disable = true
-
-		// 7. 降低 Geodata 内存占用并关闭自动更新，防止后台下载导致 OOM
-		cfg.General.GeodataLoader = "memconservative"
-		cfg.General.GeoAutoUpdate = false
-
-		// 8. 关闭嗅探 (Sniffing) 和控制 DNS 缓存以减少内存和 CPU 消耗
-		cfg.General.Sniffing = false
-		if cfg.DNS != nil {
-			if cfg.DNS.CacheMaxSize == 0 || cfg.DNS.CacheMaxSize > 512 {
-				cfg.DNS.CacheMaxSize = 512
-			}
-			// 限制并发查询，防止瞬间 DNS 并发导致内存激增
-			// 默认没有直接的 DNS 并发限制，但可以缩小 FakeIP 范围，或者关闭增强 DNS 解析
-		}
-
-		// 9. 强制限制全局连接数和并发测速，防止由于测速或者大流量导致协程/连接池暴增 (OOM)
-		// 如果规则提供者中有大量的测速，会瞬间产生大量 TCP 连接
-		// (通过覆盖或初始化配置)
-	})
+	err := hub.Parse(nil, applyIOSConfigOverrides)
 	if err != nil {
-		panic(err)
+		log.Errorln("start config apply failed: %s", err.Error())
+		return
 	}
 
 	isActive = true
@@ -213,12 +258,17 @@ func ForceUpdateConfig(configFileName string) {
 	if homeDir == "" {
 		return
 	}
+	previousCfgFile := cfgFile
 	cfgFile = configFileName
 	C.SetConfig(filepath.Join(homeDir, cfgFile))
 	cfg, err := executor.Parse()
 	if err != nil {
-		panic(err)
+		cfgFile = previousCfgFile
+		C.SetConfig(filepath.Join(homeDir, cfgFile))
+		log.Errorln("force update config failed: %s", err.Error())
+		return
 	}
+	applyIOSConfigOverrides(cfg)
 	hub.ApplyConfig(cfg)
 }
 
@@ -296,6 +346,140 @@ func SelectProxy(groupName, proxyName string) bool {
 func TrafficUp() int64 {
 	up, _ := statistic.DefaultManager.Now()
 	return up
+}
+
+func (o *TunOptions) JSON() string {
+	if o == nil {
+		return "{}"
+	}
+	return o.json
+}
+
+func (o *TunOptions) Name() string {
+	if o == nil {
+		return ""
+	}
+	return o.payload.Name
+}
+
+func (o *TunOptions) MTU() int64 {
+	if o == nil {
+		return 0
+	}
+	return int64(o.payload.MTU)
+}
+
+func (o *TunOptions) Stack() string {
+	if o == nil {
+		return ""
+	}
+	return o.payload.Stack
+}
+
+func (o *TunOptions) AutoRoute() bool {
+	return o != nil && o.payload.AutoRoute
+}
+
+func (o *TunOptions) StrictRoute() bool {
+	return o != nil && o.payload.StrictRoute
+}
+
+func (o *TunOptions) DNSHijack() string {
+	if o == nil {
+		return ""
+	}
+	return strings.Join(o.payload.DNSHijack, ",")
+}
+
+func (o *TunOptions) DNSServers() string {
+	if o == nil {
+		return ""
+	}
+	return strings.Join(o.payload.DNSServers, ",")
+}
+
+func (o *TunOptions) Inet4Address() string {
+	if o == nil {
+		return ""
+	}
+	return strings.Join(o.payload.Inet4Address, ",")
+}
+
+func (o *TunOptions) Inet6Address() string {
+	if o == nil {
+		return ""
+	}
+	return strings.Join(o.payload.Inet6Address, ",")
+}
+
+func (o *TunOptions) RouteAddress() string {
+	if o == nil {
+		return ""
+	}
+	return strings.Join(o.payload.RouteAddress, ",")
+}
+
+func (o *TunOptions) RouteExcludeAddress() string {
+	if o == nil {
+		return ""
+	}
+	return strings.Join(o.payload.RouteExcludeAddress, ",")
+}
+
+func (o *TunOptions) IncludeInterface() string {
+	if o == nil {
+		return ""
+	}
+	return strings.Join(o.payload.IncludeInterface, ",")
+}
+
+func (o *TunOptions) ExcludeInterface() string {
+	if o == nil {
+		return ""
+	}
+	return strings.Join(o.payload.ExcludeInterface, ",")
+}
+
+func (o *TunOptions) DisableICMPForwarding() bool {
+	return o != nil && o.payload.DisableICMPForwarding
+}
+
+func newTunOptions(options *sing_tun.PlatformTunOptions) *TunOptions {
+	payload := tunOptionsPayload{
+		Name:                  options.Name,
+		MTU:                   options.MTU,
+		Stack:                 options.Stack,
+		AutoRoute:             options.AutoRoute,
+		StrictRoute:           options.StrictRoute,
+		DNSHijack:             append([]string(nil), options.DNSHijack...),
+		DNSServers:            append([]string(nil), options.DNSServers...),
+		Inet4Address:          prefixesToStrings(options.Inet4Address),
+		Inet6Address:          prefixesToStrings(options.Inet6Address),
+		RouteAddress:          prefixesToStrings(options.RouteAddress),
+		RouteExcludeAddress:   prefixesToStrings(options.RouteExcludeAddress),
+		IncludeInterface:      append([]string(nil), options.IncludeInterface...),
+		ExcludeInterface:      append([]string(nil), options.ExcludeInterface...),
+		DisableICMPForwarding: options.DisableICMPForwarding,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		data = []byte("{}")
+	}
+	return &TunOptions{
+		payload: payload,
+		json:    string(data),
+	}
+}
+
+func prefixesToStrings(prefixes []netip.Prefix) []string {
+	if len(prefixes) == 0 {
+		return nil
+	}
+	items := make([]string, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		items = append(items, prefix.String())
+	}
+	return items
 }
 
 func TrafficDown() int64 {
